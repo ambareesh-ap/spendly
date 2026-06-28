@@ -563,3 +563,19 @@
   color: #16a34a;
   background: rgba(22, 163, 74, 0.08);
 }
+
+/* ── Conversion & notes ─────────────────────────────────────────────────────── */
+
+.expense-card-conversion {
+  font-size: 12px;
+  color: var(--text);
+  margin-bottom: 2px;
+}
+
+.log-row-notes {
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

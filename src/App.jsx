@@ -2,27 +2,61 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { supabase } from './supabaseClient'
 import './App.css'
 
+// ── Categories ─────────────────────────────────────────────────────────────────
+// defaultBudget = monthly CAD target (0 = no meaningful budget for that category)
+
 const CATEGORIES = [
-  { name: 'Food & Drink',      emoji: '🍔' },
-  { name: 'Transport',         emoji: '🚗' },
-  { name: 'Health',            emoji: '💊' },
-  { name: 'Shopping',          emoji: '🛍️' },
-  { name: 'Entertainment',     emoji: '🎬' },
-  { name: 'Bills & Utilities', emoji: '🏠' },
-  { name: 'Other',             emoji: '📦' },
+  { name: 'Rent',                  emoji: '🏠',  defaultBudget: 2700 },
+  { name: 'Internet',              emoji: '🌐',  defaultBudget: 75   },
+  { name: 'Phone Bill',            emoji: '📱',  defaultBudget: 75   },
+  { name: 'Electricity',           emoji: '⚡',  defaultBudget: 75   },
+  { name: 'Groceries',             emoji: '🛒',  defaultBudget: 500  },
+  { name: 'Self-care/Hygiene',     emoji: '🧴',  defaultBudget: 300  },
+  { name: 'Travel',                emoji: '✈️',  defaultBudget: 1000 },
+  { name: 'Transportation',        emoji: '🚌',  defaultBudget: 250  },
+  { name: 'Furniture/Cookware',    emoji: '🪑',  defaultBudget: 300  },
+  { name: 'Clothing/Footwear',     emoji: '👟',  defaultBudget: 200  },
+  { name: 'Electronics',           emoji: '💻',  defaultBudget: 300  },
+  { name: 'Restaurants',           emoji: '🍽️',  defaultBudget: 300  },
+  { name: 'Entertainment',         emoji: '🎬',  defaultBudget: 200  },
+  { name: 'Dog Care & Food',       emoji: '🐕',  defaultBudget: 250  },
+  { name: 'Dog Toys',              emoji: '🦴',  defaultBudget: 75   },
+  { name: 'Credit Card Fees',      emoji: '💳',  defaultBudget: 15   },
+  { name: 'Gym/Classes Membership',emoji: '🏋️',  defaultBudget: 75   },
+  { name: 'TFSA',                  emoji: '💰',  defaultBudget: 1166 },
+  { name: 'RRSP',                  emoji: '🏦',  defaultBudget: 3000 },
+  { name: 'Money to India',        emoji: '🇮🇳',  defaultBudget: 3000 },
+  { name: 'Domains/Cloud',         emoji: '☁️',  defaultBudget: 50   },
+  { name: 'Gifts',                 emoji: '🎁',  defaultBudget: 500  },
+  { name: 'Miscellaneous',         emoji: '📦',  defaultBudget: 0    },
+  { name: 'FHSA',                  emoji: '🏡',  defaultBudget: 667  },
+  { name: 'Refunds',               emoji: '↩️',  defaultBudget: 0    },
 ]
+
 const CATEGORY_EMOJI = Object.fromEntries(CATEGORIES.map(c => [c.name, c.emoji]))
+const CATEGORY_NAMES = CATEGORIES.map(c => c.name).join(', ')
 
-const SYSTEM_PROMPT = `You are an expense parsing assistant. Extract expense details from the user's message and respond ONLY with a valid JSON object in this exact format:
-{"amount": <number>, "merchant": "<string>", "category": "<category>"}
+const SYSTEM_PROMPT = `You are an expense parsing assistant for a Canadian user. Extract expense details from the user's message and respond ONLY with a valid JSON object in this exact format:
+{"amount": <number>, "merchant": "<string>", "category": "<category>", "notes": <string|null>, "original_amount": <number|null>, "original_currency": "<ISO 4217 code|null>"}
 
-Allowed categories: Food & Drink, Transport, Health, Shopping, Entertainment, Bills & Utilities, Other
+Allowed categories: ${CATEGORY_NAMES}
 
 Rules:
-- amount must be a positive number with no currency symbols
-- merchant is the store or service name, properly capitalized
-- category must be exactly one of the allowed values
-- If you cannot identify a clear expense, respond with: {"error": "I couldn't find an expense in that message. Try something like 'spent $12 on coffee at Starbucks'."}`
+- amount: the numeric value the user mentioned, always positive, no currency symbols
+- merchant: the store, service, or payee name, properly capitalized
+- category: must be exactly one of the allowed values above
+- notes: any specific contextual detail — a dish name, location, person, occasion, or purpose. null if nothing notable
+- original_currency: if the user mentions a non-CAD currency, its ISO 4217 code (e.g. "AED" for dirhams, "EUR" for euros, "INR" for rupees, "USD" for US dollars when explicitly stated). null if the amount is CAD or no currency is specified
+- original_amount: same numeric value as amount when original_currency is not null, otherwise null
+- If you cannot identify a clear expense, return: {"error": "couldn't parse that — try something like 'paid rent $2700' or 'spent 500 dirhams on groceries'"}
+
+STRICT OUTPUT FORMAT:
+- Start your response with { and end with }
+- Never include any explanation, apology, or text outside the JSON
+- Never start your response with the word I
+- If you cannot parse an expense for any reason, still return valid JSON using the error key above`
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
 
 function formatDate(dateStr) {
   const [y, m, d] = dateStr.split('-').map(Number)
@@ -41,11 +75,17 @@ function formatMonth(yyyyMM) {
 // ── Chat sub-components ────────────────────────────────────────────────────────
 
 function ExpenseCard({ expense }) {
+  const hasConversion = expense.original_currency && expense.original_currency !== 'CAD'
   return (
     <div className="expense-card">
       <div className="expense-card-icon">{CATEGORY_EMOJI[expense.category] ?? '📦'}</div>
       <div className="expense-card-details">
         <div className="expense-card-amount">${Number(expense.amount).toFixed(2)}</div>
+        {hasConversion && (
+          <div className="expense-card-conversion">
+            converted from {Number(expense.original_amount).toLocaleString()} {expense.original_currency}
+          </div>
+        )}
         <div className="expense-card-merchant">{expense.merchant}</div>
         <span className="category-pill">{expense.category}</span>
       </div>
@@ -93,6 +133,7 @@ function LogView({ expenses, loading, onDelete }) {
           <div className="log-row-icon">{CATEGORY_EMOJI[exp.category] ?? '📦'}</div>
           <div className="log-row-info">
             <div className="log-row-merchant">{exp.merchant}</div>
+            {exp.notes && <div className="log-row-notes">{exp.notes}</div>}
             <span className="category-pill">{exp.category}</span>
           </div>
           <div className="log-row-meta">
@@ -156,8 +197,11 @@ function SummaryView({ expenses }) {
 // ── Budgets view ───────────────────────────────────────────────────────────────
 
 function BudgetView({ budgetMap, onSave }) {
+  // Pre-fill inputs with defaultBudget; Supabase values override on load
   const [inputs, setInputs] = useState(() =>
-    Object.fromEntries(CATEGORIES.map(c => [c.name, '']))
+    Object.fromEntries(
+      CATEGORIES.map(c => [c.name, c.defaultBudget > 0 ? String(c.defaultBudget) : ''])
+    )
   )
   const [saving, setSaving] = useState(new Set())
   const [saved, setSaved] = useState(new Set())
@@ -229,18 +273,16 @@ export default function App() {
     {
       id: 1,
       role: 'assistant',
-      text: "Hi! Tell me about an expense and I'll log it for you. Try something like \"spent $12 on coffee at Starbucks\".",
+      text: "Hi! Tell me about an expense and I'll log it for you. Try something like \"paid rent $2700\" or \"spent 500 dirhams on groceries\".",
     },
   ])
   const [expenses, setExpenses] = useState([])
   const [expensesLoading, setExpensesLoading] = useState(false)
-  // { [category]: { id, amount } }
   const [budgetMap, setBudgetMap] = useState({})
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const bottomRef = useRef(null)
 
-  // Returns the fresh rows so sendMessage can use them without waiting for React state
   const fetchExpenses = useCallback(async () => {
     setExpensesLoading(true)
     const { data, error } = await supabase
@@ -296,6 +338,7 @@ export default function App() {
     setLoading(true)
 
     try {
+      // ── Step 1: parse with Claude ──────────────────────────────────────────
       const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
@@ -306,7 +349,7 @@ export default function App() {
         },
         body: JSON.stringify({
           model: 'claude-sonnet-4-6',
-          max_tokens: 256,
+          max_tokens: 300,
           system: SYSTEM_PROMPT,
           messages: [{ role: 'user', content: text }],
         }),
@@ -318,28 +361,63 @@ export default function App() {
       }
 
       const data = await response.json()
-      const parsed = JSON.parse(data.content[0].text)
+      const rawText = data.content[0].text.trim()
+
+      if (!rawText.startsWith('{')) {
+        setMessages(prev => [...prev, {
+          id: Date.now(), role: 'assistant',
+          text: "I couldn't understand that as an expense. Try something like \"paid rent $2700\" or \"spent $15 at Tim Hortons\".",
+        }])
+        return
+      }
+
+      let parsed
+      try {
+        parsed = JSON.parse(rawText)
+      } catch {
+        setMessages(prev => [...prev, {
+          id: Date.now(), role: 'assistant',
+          text: "Got an unexpected response — please try rephrasing your expense.",
+        }])
+        return
+      }
 
       if (parsed.error) {
         setMessages(prev => [...prev, { id: Date.now(), role: 'assistant', text: parsed.error }])
         return
       }
 
-      const { amount, merchant, category } = parsed
+      const { amount, merchant, category, notes, original_amount, original_currency } = parsed
 
+      // ── Step 2: currency conversion if needed ──────────────────────────────
+      let finalAmount = amount
+      const needsConversion = original_currency && original_currency !== 'CAD'
+
+      if (needsConversion) {
+        const rateRes = await fetch('https://open.er-api.com/v6/latest/CAD')
+        if (!rateRes.ok) throw new Error('Could not fetch exchange rates')
+        const rateData = await rateRes.json()
+        const rate = rateData.rates[original_currency]
+        if (!rate) throw new Error(`Unknown currency code: ${original_currency}`)
+        // rates are "how many [foreign] per 1 CAD", so divide to get CAD
+        finalAmount = original_amount / rate
+      }
+
+      // ── Step 3: save to Supabase ───────────────────────────────────────────
       const { error: dbError } = await supabase.from('expenses').insert({
-        amount,
+        amount: finalAmount,
         merchant,
         category,
         date: new Date().toISOString().split('T')[0],
+        notes: notes ?? null,
+        original_amount: needsConversion ? original_amount : null,
+        original_currency: needsConversion ? original_currency : null,
       })
 
       if (dbError) throw new Error(dbError.message)
 
-      // Use the returned fresh data — React state won't have updated yet
+      // ── Step 4: budget warning ─────────────────────────────────────────────
       const freshExpenses = await fetchExpenses()
-
-      // Budget warning: sum this category's spend for the current calendar month
       const currentMonth = new Date().toISOString().slice(0, 7)
       const monthTotal = freshExpenses
         .filter(e => e.category === category && e.date.slice(0, 7) === currentMonth)
@@ -364,7 +442,13 @@ export default function App() {
             id: Date.now(),
             role: 'assistant',
             text: "Got it! I've logged your expense:",
-            expense: { amount, merchant, category },
+            expense: {
+              amount: finalAmount,
+              merchant,
+              category,
+              original_amount: needsConversion ? original_amount : null,
+              original_currency: needsConversion ? original_currency : null,
+            },
           },
         ]
         if (warningText) next.push({ id: Date.now() + 1, role: 'assistant', text: warningText })
@@ -420,7 +504,7 @@ export default function App() {
           <input
             className="input-field"
             type="text"
-            placeholder='e.g. spent $12 on coffee at Starbucks'
+            placeholder='e.g. paid rent $2700 or spent 500 dirhams on groceries'
             value={input}
             onChange={e => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
