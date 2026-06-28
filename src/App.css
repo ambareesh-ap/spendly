@@ -437,6 +437,67 @@
   margin-right: 8px;
 }
 
+/* ── Summary header (current month + totals) ────────────────────────────────── */
+
+.summary-header {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.summary-current-month {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text-h);
+  margin: 0;
+  letter-spacing: -0.4px;
+}
+
+.summary-totals {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
+.summary-totals-sep {
+  width: 1px;
+  height: 28px;
+  background: var(--border);
+  flex-shrink: 0;
+}
+
+.summary-total-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.summary-total-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text);
+}
+
+.summary-total-value {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-h);
+  letter-spacing: -0.3px;
+}
+
+.summary-remaining {
+  color: #16a34a;
+}
+
+.summary-over {
+  color: #dc2626;
+}
+
 /* ── Budgets view ───────────────────────────────────────────────────────────── */
 
 .budgets-view {

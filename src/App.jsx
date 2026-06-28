@@ -36,25 +36,55 @@ const CATEGORIES = [
 const CATEGORY_EMOJI = Object.fromEntries(CATEGORIES.map(c => [c.name, c.emoji]))
 const CATEGORY_NAMES = CATEGORIES.map(c => c.name).join(', ')
 
-const SYSTEM_PROMPT = `You are an expense parsing assistant for a Canadian user. Extract expense details from the user's message and respond ONLY with a valid JSON object in this exact format:
-{"amount": <number>, "merchant": "<string>", "category": "<category>", "notes": <string|null>, "original_amount": <number|null>, "original_currency": "<ISO 4217 code|null>"}
+function buildSystemPrompt(today) {
+  return `You are an expense parsing assistant for a Canadian user. Today's date is ${today}. You respond ONLY with one of two valid JSON shapes — nothing else.
+
+SHAPE 1 — confident, log it:
+{"ready": true, "amount": <number>, "merchant": "<string>", "category": "<category>", "notes": <string|null>, "original_amount": <number|null>, "original_currency": "<ISO 4217 code|null>", "date": "<YYYY-MM-DD>"}
+
+SHAPE 2 — genuinely ambiguous, ask one clarifying question:
+{"ready": false, "question": "<one short question>", "partial": {"amount": <number|null>, "merchant": "<string|null>"}}
 
 Allowed categories: ${CATEGORY_NAMES}
 
-Rules:
+Shape 1 field rules:
 - amount: the numeric value the user mentioned, always positive, no currency symbols
 - merchant: the store, service, or payee name, properly capitalized
 - category: must be exactly one of the allowed values above
-- notes: any specific contextual detail — a dish name, location, person, occasion, or purpose. null if nothing notable
-- original_currency: if the user mentions a non-CAD currency, its ISO 4217 code (e.g. "AED" for dirhams, "EUR" for euros, "INR" for rupees, "USD" for US dollars when explicitly stated). null if the amount is CAD or no currency is specified
-- original_amount: same numeric value as amount when original_currency is not null, otherwise null
-- If you cannot identify a clear expense, return: {"error": "couldn't parse that — try something like 'paid rent $2700' or 'spent 500 dirhams on groceries'"}
+- notes: any specific contextual detail — dish name, location, person, occasion, purpose. null if nothing notable
+- original_currency: ISO 4217 code if the user mentions a non-CAD currency (e.g. "AED", "EUR", "INR", "USD"). null if CAD or unspecified
+- original_amount: same value as amount when original_currency is not null, otherwise null
+- date: the expense date in YYYY-MM-DD format. Infer from today (${today}) using these rules:
+  • Any explicit date or day name ("June 15", "on Tuesday", "the 3rd") → infer exactly, set ready: true
+  • "yesterday" → 1 day before today
+  • "last week" or "this past week" → 7 days before today (same weekday)
+  • "this week" → today
+  • "last month" → first day of the previous calendar month
+  • "this month" → today
+  • "last year" → same month and day, one year ago
+  • "a few days ago" → 3 days before today
+  • "recently", "the other day", "a while ago", "earlier" → today
+  • ANY other relative time reference → make a reasonable inference and set ready: true
+  • If the user gives ZERO time context of any kind (no day, no week, no month, no relative phrase) AND amount is $50 or under → today, silently, ready: true
+  • If the user gives ZERO time context of any kind AND amount is over $50 → use Shape 2 to ask "Was this today, or a different date?" — but only after category is resolved; ask category first if that's also unclear
+
+When to use Shape 2 (ask one question):
+- Category is genuinely ambiguous between two very different buckets (e.g. Electronics vs Entertainment for a gaming purchase) — ask category first
+- No date mentioned and amount > $50, and category is already resolved — ask date
+- The message is so vague you cannot extract a merchant or amount at all
+
+When NOT to use Shape 2 (just log it with Shape 1):
+- Obvious merchant → category pairs: Tim Hortons → Restaurants, Uber → Transportation, Netflix → Entertainment
+- Savings/investment contributions: TFSA, RRSP, FHSA, Money to India → use those category names directly
+- Any purchase $50 or under — pick the most likely category and default date to today
+- When the conversation history already resolved the ambiguity
 
 STRICT OUTPUT FORMAT:
 - Start your response with { and end with }
 - Never include any explanation, apology, or text outside the JSON
 - Never start your response with the word I
-- If you cannot parse an expense for any reason, still return valid JSON using the error key above`
+- If you cannot identify any expense at all, use Shape 2 with a question like "What did you spend money on?"`
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -147,15 +177,100 @@ function LogView({ expenses, loading, onDelete }) {
   )
 }
 
-// ── Summary view ───────────────────────────────────────────────────────────────
+// ── Summary view (current month only) ─────────────────────────────────────────
 
-function SummaryView({ expenses }) {
-  if (!expenses.length) {
-    return <div className="empty-state">No expenses yet. Head to Chat to log one.</div>
+function SummaryView({ expenses, budgetMap }) {
+  const currentMonth = new Date().toISOString().slice(0, 7)
+  const monthExpenses = expenses.filter(e => e.date.slice(0, 7) === currentMonth)
+
+  const byCategory = {}
+  for (const exp of monthExpenses) {
+    byCategory[exp.category] = (byCategory[exp.category] ?? 0) + Number(exp.amount)
+  }
+  const sorted = Object.entries(byCategory).sort((a, b) => b[1] - a[1])
+  const totalSpent = sorted.reduce((sum, [, amt]) => sum + amt, 0)
+  const totalBudgeted = Object.values(budgetMap).reduce((sum, { amount }) => sum + amount, 0)
+  const hasBudgets = totalBudgeted > 0
+  const remaining = totalBudgeted - totalSpent
+
+  return (
+    <div className="summary-view">
+      <div className="summary-header">
+        <h2 className="summary-current-month">{formatMonth(currentMonth)}</h2>
+        <div className="summary-totals">
+          <div className="summary-total-item">
+            <span className="summary-total-label">Spent</span>
+            <span className="summary-total-value">${totalSpent.toFixed(2)}</span>
+          </div>
+          {hasBudgets && (
+            <>
+              <div className="summary-totals-sep" />
+              <div className="summary-total-item">
+                <span className="summary-total-label">Budgeted</span>
+                <span className="summary-total-value">${totalBudgeted.toFixed(2)}</span>
+              </div>
+              <div className="summary-totals-sep" />
+              <div className="summary-total-item">
+                <span className="summary-total-label">{remaining >= 0 ? 'Remaining' : 'Over'}</span>
+                <span className={`summary-total-value ${remaining >= 0 ? 'summary-remaining' : 'summary-over'}`}>
+                  ${Math.abs(remaining).toFixed(2)}
+                </span>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+
+      {sorted.length === 0 ? (
+        <div className="empty-state" style={{ flex: 'none', padding: '32px 0 0' }}>
+          No expenses logged this month yet.
+        </div>
+      ) : (
+        <table className="summary-table">
+          <thead>
+            <tr>
+              <th>Category</th>
+              <th>Spent</th>
+              {hasBudgets && <th>Budget</th>}
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map(([cat, amt]) => {
+              const catBudget = budgetMap[cat]?.amount
+              return (
+                <tr key={cat}>
+                  <td><span className="cat-emoji">{CATEGORY_EMOJI[cat] ?? '📦'}</span>{cat}</td>
+                  <td>${amt.toFixed(2)}</td>
+                  {hasBudgets && <td>{catBudget ? `$${catBudget.toFixed(0)}` : '—'}</td>}
+                </tr>
+              )
+            })}
+          </tbody>
+          <tfoot>
+            <tr>
+              <td>Total</td>
+              <td>${totalSpent.toFixed(2)}</td>
+              {hasBudgets && <td>${totalBudgeted.toFixed(0)}</td>}
+            </tr>
+          </tfoot>
+        </table>
+      )}
+    </div>
+  )
+}
+
+// ── Archive view (past months) ─────────────────────────────────────────────────
+
+function ArchiveView({ expenses }) {
+  const currentMonth = new Date().toISOString().slice(0, 7)
+  const past = expenses.filter(e => e.date.slice(0, 7) < currentMonth)
+
+  if (!past.length) {
+    return <div className="empty-state">Past months will appear here automatically.</div>
   }
 
   const byMonth = {}
-  for (const exp of expenses) {
+  for (const exp of past) {
     const month = exp.date.slice(0, 7)
     if (!byMonth[month]) byMonth[month] = {}
     byMonth[month][exp.category] = (byMonth[month][exp.category] ?? 0) + Number(exp.amount)
@@ -265,7 +380,7 @@ function BudgetView({ budgetMap, onSave }) {
 
 // ── App ────────────────────────────────────────────────────────────────────────
 
-const TABS = ['chat', 'log', 'summary', 'budgets']
+const TABS = ['chat', 'log', 'summary', 'archive', 'budgets']
 
 export default function App() {
   const [tab, setTab] = useState('chat')
@@ -279,6 +394,9 @@ export default function App() {
   const [expenses, setExpenses] = useState([])
   const [expensesLoading, setExpensesLoading] = useState(false)
   const [budgetMap, setBudgetMap] = useState({})
+  // pendingExpense holds the conversation thread when Claude asks a clarifying question
+  // { thread: Array<{role, content}> } — appended each turn until ready: true
+  const [pendingExpense, setPendingExpense] = useState(null)
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const bottomRef = useRef(null)
@@ -338,7 +456,16 @@ export default function App() {
     setLoading(true)
 
     try {
-      // ── Step 1: parse with Claude ──────────────────────────────────────────
+      const today = new Date().toISOString().split('T')[0]
+
+      // ── Step 1: build message history ─────────────────────────────────────
+      // If we're in a clarification loop, prepend the existing thread so Claude
+      // has full context. apiMessages ends with the current user turn.
+      const apiMessages = pendingExpense
+        ? [...pendingExpense.thread, { role: 'user', content: text }]
+        : [{ role: 'user', content: text }]
+
+      // ── Step 2: call Claude ────────────────────────────────────────────────
       const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
@@ -350,8 +477,8 @@ export default function App() {
         body: JSON.stringify({
           model: 'claude-sonnet-4-6',
           max_tokens: 300,
-          system: SYSTEM_PROMPT,
-          messages: [{ role: 'user', content: text }],
+          system: buildSystemPrompt(today),
+          messages: apiMessages,
         }),
       })
 
@@ -382,14 +509,22 @@ export default function App() {
         return
       }
 
-      if (parsed.error) {
-        setMessages(prev => [...prev, { id: Date.now(), role: 'assistant', text: parsed.error }])
+      // ── Step 3: clarification needed — ask and wait ────────────────────────
+      if (!parsed.ready) {
+        setMessages(prev => [...prev, {
+          id: Date.now(), role: 'assistant', text: parsed.question,
+        }])
+        // Extend the thread with this turn so the next reply has full context
+        setPendingExpense({ thread: [...apiMessages, { role: 'assistant', content: rawText }] })
         return
       }
 
-      const { amount, merchant, category, notes, original_amount, original_currency } = parsed
+      // ── Step 4: ready — clear pending, extract fields ──────────────────────
+      setPendingExpense(null)
 
-      // ── Step 2: currency conversion if needed ──────────────────────────────
+      const { amount, merchant, category, notes, original_amount, original_currency, date } = parsed
+
+      // ── Step 5: currency conversion if needed ──────────────────────────────
       let finalAmount = amount
       const needsConversion = original_currency && original_currency !== 'CAD'
 
@@ -399,16 +534,15 @@ export default function App() {
         const rateData = await rateRes.json()
         const rate = rateData.rates[original_currency]
         if (!rate) throw new Error(`Unknown currency code: ${original_currency}`)
-        // rates are "how many [foreign] per 1 CAD", so divide to get CAD
         finalAmount = original_amount / rate
       }
 
-      // ── Step 3: save to Supabase ───────────────────────────────────────────
+      // ── Step 6: save to Supabase ───────────────────────────────────────────
       const { error: dbError } = await supabase.from('expenses').insert({
         amount: finalAmount,
         merchant,
         category,
-        date: new Date().toISOString().split('T')[0],
+        date: date ?? today,
         notes: notes ?? null,
         original_amount: needsConversion ? original_amount : null,
         original_currency: needsConversion ? original_currency : null,
@@ -416,7 +550,7 @@ export default function App() {
 
       if (dbError) throw new Error(dbError.message)
 
-      // ── Step 4: budget warning ─────────────────────────────────────────────
+      // ── Step 7: budget warning ─────────────────────────────────────────────
       const freshExpenses = await fetchExpenses()
       const currentMonth = new Date().toISOString().slice(0, 7)
       const monthTotal = freshExpenses
@@ -521,7 +655,8 @@ export default function App() {
       </div>
 
       {tab === 'log'     && <LogView expenses={expenses} loading={expensesLoading} onDelete={handleDelete} />}
-      {tab === 'summary' && <SummaryView expenses={expenses} />}
+      {tab === 'summary' && <SummaryView expenses={expenses} budgetMap={budgetMap} />}
+      {tab === 'archive' && <ArchiveView expenses={expenses} />}
       {tab === 'budgets' && <BudgetView budgetMap={budgetMap} onSave={saveBudget} />}
     </div>
   )
