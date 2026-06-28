@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 import { supabase } from './supabaseClient'
 import './App.css'
 
@@ -36,6 +37,48 @@ const CATEGORIES = [
 const CATEGORY_EMOJI = Object.fromEntries(CATEGORIES.map(c => [c.name, c.emoji]))
 const CATEGORY_NAMES = CATEGORIES.map(c => c.name).join(', ')
 
+const SAVINGS_CATEGORIES = ['TFSA', 'FHSA', 'RRSP', 'Money to India']
+const REFUND_CATEGORIES  = ['Refunds']
+const MONTHS_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+
+function catType(cat) {
+  if (SAVINGS_CATEGORIES.includes(cat)) return 'savings'
+  if (REFUND_CATEGORIES.includes(cat))  return 'refund'
+  return 'expense'
+}
+
+// Returns 12 data points for the current calendar year.
+// Future months return null so the line ends at today.
+function buildYearChartData(expenses) {
+  const now = new Date()
+  const year = now.getFullYear()
+  const currentMonthStr = now.toISOString().slice(0, 7)
+  return MONTHS_SHORT.map((label, i) => {
+    const month = `${year}-${String(i + 1).padStart(2, '0')}`
+    if (month > currentMonthStr) return { month: label, expenses: null, savings: null }
+    const monthExps = expenses.filter(e => e.date.slice(0, 7) === month)
+    const expTotal = monthExps.filter(e => catType(e.category) === 'expense')
+      .reduce((sum, e) => sum + Number(e.amount), 0)
+    const savTotal = monthExps.filter(e => catType(e.category) !== 'expense')
+      .reduce((sum, e) => sum + Number(e.amount), 0)
+    return { month: label, expenses: expTotal, savings: savTotal }
+  })
+}
+
+function ChartTooltip({ active, payload, label }) {
+  if (!active || !payload?.length) return null
+  return (
+    <div className="chart-tooltip">
+      <div className="chart-tooltip-label">{label}</div>
+      {payload.map(p => p.value != null && (
+        <div key={p.dataKey} className="chart-tooltip-row" style={{ color: p.stroke }}>
+          {p.dataKey === 'expenses' ? 'Expenses' : 'Savings'}: ${Number(p.value).toFixed(2)}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function buildSystemPrompt(today) {
   return `You are an expense parsing assistant for a Canadian user. Today's date is ${today}. You respond ONLY with one of three valid JSON shapes — nothing else.
 
@@ -72,20 +115,24 @@ Shape 1 field rules:
   • Zero time context AND amount > $50 → Shape 2: "Was this today, or a different date?" (only after category is resolved; ask category first if unclear)
 
 Shape 3 field rules:
-- Use when the user says "fix", "correct", "change", "update", "wrong", "actually it was", etc. about a past expense
-- target: use "last" if they say "my last expense" or don't specify which one; otherwise use the merchant name or a short description (e.g. "Walmart", "coffee", "rent")
-- fields: only include the keys the user wants to change (amount, merchant, category, notes, date)
+- Use when the user says "fix", "correct", "change", "update", "wrong", "actually it was", etc.
+- ALSO use for short follow-ups that clearly refer back to the last logged expense — e.g. "its toys", "actually restaurants", "put it under entertainment", "no wait, clothing", "should be groceries". These are category corrections: target "last", fields: {category: <matched value>}
+- When the user message begins with [Context — last logged expense: ...], use that to understand what expense they may be correcting
+- target: "last" when they don't specify which expense; otherwise use the merchant name or description
+- fields: only the keys being changed (amount, merchant, category, notes, date)
 
 When to use Shape 2 (ask one question):
 - Category genuinely ambiguous between very different buckets — ask category first
+- Merchant is a general-merchandise store with no obvious category (e.g. Miniso, Winners, HomeSense, Dollar Tree) — ask "What did you buy at [merchant]?"
 - No date context and amount > $50, category already resolved — ask date
 - Message too vague to extract merchant or amount
 
 When NOT to use Shape 2:
 - Obvious merchant → category: Tim Hortons → Restaurants, Uber → Transportation, Netflix → Entertainment
 - Savings contributions: TFSA, RRSP, FHSA, Money to India → use those categories directly
-- Any purchase $50 or under — pick most likely category, default date to today
+- Any purchase $50 or under with a clear category — pick it directly
 - Conversation history already resolved the ambiguity
+- NEVER default to Miscellaneous for an ambiguous merchant — ask what they bought instead
 
 STRICT OUTPUT FORMAT:
 - Start your response with { and end with }
@@ -261,27 +308,75 @@ function LogView({ expenses, loading, onDelete, onUpdate }) {
 // ── Summary view (current month only) ─────────────────────────────────────────
 
 function SummaryView({ expenses, budgetMap }) {
-  const currentMonth = new Date().toISOString().slice(0, 7)
+  const now = new Date()
+  const currentMonth = now.toISOString().slice(0, 7)
+  const currentMonthLabel = MONTHS_SHORT[now.getMonth()]
+
   const monthExpenses = expenses.filter(e => e.date.slice(0, 7) === currentMonth)
 
   const byCategory = {}
   for (const exp of monthExpenses) {
     byCategory[exp.category] = (byCategory[exp.category] ?? 0) + Number(exp.amount)
   }
-  const sorted = Object.entries(byCategory).sort((a, b) => b[1] - a[1])
-  const totalSpent = sorted.reduce((sum, [, amt]) => sum + amt, 0)
-  const totalBudgeted = Object.values(budgetMap).reduce((sum, { amount }) => sum + amount, 0)
+
+  const expenseEntries = Object.entries(byCategory).filter(([c]) => catType(c) === 'expense').sort((a, b) => b[1] - a[1])
+  const savingsEntries = Object.entries(byCategory).filter(([c]) => catType(c) === 'savings').sort((a, b) => b[1] - a[1])
+  const refundEntries  = Object.entries(byCategory).filter(([c]) => catType(c) === 'refund').sort((a, b) => b[1] - a[1])
+
+  const totalExpenses = expenseEntries.reduce((s, [, v]) => s + v, 0)
+  const totalSaved    = [...savingsEntries, ...refundEntries].reduce((s, [, v]) => s + v, 0)
+
+  // Budgets only track expense categories
+  const totalBudgeted = Object.entries(budgetMap)
+    .filter(([cat]) => catType(cat) === 'expense')
+    .reduce((s, [, { amount }]) => s + amount, 0)
   const hasBudgets = totalBudgeted > 0
-  const remaining = totalBudgeted - totalSpent
+  const remaining  = totalBudgeted - totalExpenses
+
+  const hasAny = expenseEntries.length + savingsEntries.length + refundEntries.length > 0
+  const chartData = buildYearChartData(expenses)
+
+  const makeDot = (color) => ({ cx, cy, payload, value }) => {
+    if (value == null || cx == null) return null
+    const r = payload.month === currentMonthLabel ? 5 : 3
+    return <circle cx={cx} cy={cy} r={r} fill={color}
+      stroke={payload.month === currentMonthLabel ? '#0a0e1a' : 'none'}
+      strokeWidth={payload.month === currentMonthLabel ? 2 : 0} />
+  }
 
   return (
     <div className="summary-view">
+
+      {/* ── Year trend chart ── */}
+      <div className="summary-chart-card">
+        <div className="summary-chart-title">{now.getFullYear()} · Monthly Trend</div>
+        <ResponsiveContainer width="100%" height={200}>
+          <LineChart data={chartData} margin={{ top: 12, right: 16, left: 0, bottom: 0 }}>
+            <XAxis dataKey="month" tick={{ fill: '#475569', fontSize: 11 }}
+              axisLine={{ stroke: '#1e2d45' }} tickLine={false} />
+            <YAxis tick={{ fill: '#475569', fontSize: 11 }} axisLine={false} tickLine={false}
+              tickFormatter={v => `$${v}`} width={54} />
+            <Tooltip content={<ChartTooltip />} cursor={{ stroke: '#1e2d45' }} />
+            <Line type="monotone" dataKey="expenses" stroke="#3b82f6" strokeWidth={2}
+              dot={makeDot('#3b82f6')} connectNulls={false} activeDot={{ r: 5, fill: '#3b82f6' }} />
+            <Line type="monotone" dataKey="savings"  stroke="#10b981" strokeWidth={2}
+              dot={makeDot('#10b981')} connectNulls={false} activeDot={{ r: 5, fill: '#10b981' }} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* ── Month totals header ── */}
       <div className="summary-header">
         <h2 className="summary-current-month">{formatMonth(currentMonth)}</h2>
         <div className="summary-totals">
           <div className="summary-total-item">
-            <span className="summary-total-label">Spent</span>
-            <span className="summary-total-value">${totalSpent.toFixed(2)}</span>
+            <span className="summary-total-label">Total Spent</span>
+            <span className="summary-total-value">${totalExpenses.toFixed(2)}</span>
+          </div>
+          <div className="summary-totals-sep" />
+          <div className="summary-total-item">
+            <span className="summary-total-label">Saved + Returned</span>
+            <span className="summary-total-value summary-remaining">${totalSaved.toFixed(2)}</span>
           </div>
           {hasBudgets && (
             <>
@@ -302,7 +397,8 @@ function SummaryView({ expenses, budgetMap }) {
         </div>
       </div>
 
-      {sorted.length === 0 ? (
+      {/* ── Category breakdown table ── */}
+      {!hasAny ? (
         <div className="empty-state" style={{ flex: 'none', padding: '32px 0 0' }}>
           No expenses logged this month yet.
         </div>
@@ -311,26 +407,67 @@ function SummaryView({ expenses, budgetMap }) {
           <thead>
             <tr>
               <th>Category</th>
-              <th>Spent</th>
+              <th>Amount</th>
               {hasBudgets && <th>Budget</th>}
             </tr>
           </thead>
           <tbody>
-            {sorted.map(([cat, amt]) => {
-              const catBudget = budgetMap[cat]?.amount
-              return (
+            {expenseEntries.length > 0 && <>
+              <tr className="summary-section-header">
+                <td colSpan={hasBudgets ? 3 : 2}>Expenses</td>
+              </tr>
+              {expenseEntries.map(([cat, amt]) => {
+                const catBudget = budgetMap[cat]?.amount
+                const pct    = catBudget ? (amt / catBudget) * 100 : null
+                const barMod = pct == null ? null : pct > 100 ? 'over' : pct >= 75 ? 'warn' : 'ok'
+                return (
+                  <tr key={cat}>
+                    <td><span className="cat-emoji">{CATEGORY_EMOJI[cat] ?? '📦'}</span>{cat}</td>
+                    <td>
+                      <div className="summary-spent-cell">
+                        <span>${amt.toFixed(2)}</span>
+                        {barMod && (
+                          <div className="summary-progress">
+                            <div className={`summary-progress-bar summary-progress-bar--${barMod}`}
+                              style={{ width: `${Math.min(pct, 100)}%` }} />
+                          </div>
+                        )}
+                      </div>
+                    </td>
+                    {hasBudgets && <td>{catBudget ? `$${catBudget.toFixed(0)}` : '—'}</td>}
+                  </tr>
+                )
+              })}
+            </>}
+            {savingsEntries.length > 0 && <>
+              <tr className="summary-section-header summary-section-header--savings">
+                <td colSpan={hasBudgets ? 3 : 2}>Savings</td>
+              </tr>
+              {savingsEntries.map(([cat, amt]) => (
                 <tr key={cat}>
                   <td><span className="cat-emoji">{CATEGORY_EMOJI[cat] ?? '📦'}</span>{cat}</td>
-                  <td>${amt.toFixed(2)}</td>
-                  {hasBudgets && <td>{catBudget ? `$${catBudget.toFixed(0)}` : '—'}</td>}
+                  <td className="summary-savings-amount">${amt.toFixed(2)}</td>
+                  {hasBudgets && <td>—</td>}
                 </tr>
-              )
-            })}
+              ))}
+            </>}
+            {refundEntries.length > 0 && <>
+              <tr className="summary-section-header summary-section-header--refund">
+                <td colSpan={hasBudgets ? 3 : 2}>Refunds</td>
+              </tr>
+              {refundEntries.map(([cat, amt]) => (
+                <tr key={cat}>
+                  <td><span className="cat-emoji">{CATEGORY_EMOJI[cat] ?? '📦'}</span>{cat}</td>
+                  <td className="summary-refund-amount">${amt.toFixed(2)}</td>
+                  {hasBudgets && <td>—</td>}
+                </tr>
+              ))}
+            </>}
           </tbody>
           <tfoot>
             <tr>
-              <td>Total</td>
-              <td>${totalSpent.toFixed(2)}</td>
+              <td>Total Spent</td>
+              <td>${totalExpenses.toFixed(2)}</td>
               {hasBudgets && <td>${totalBudgeted.toFixed(0)}</td>}
             </tr>
           </tfoot>
@@ -362,25 +499,108 @@ function ArchiveView({ expenses }) {
     <div className="summary-view">
       {months.map(month => {
         const cats = byMonth[month]
-        const sorted = Object.entries(cats).sort((a, b) => b[1] - a[1])
-        const total = sorted.reduce((sum, [, amt]) => sum + amt, 0)
+
+        const expEntries = Object.entries(cats).filter(([c]) => catType(c) === 'expense').sort((a, b) => b[1] - a[1])
+        const savEntries = Object.entries(cats).filter(([c]) => catType(c) === 'savings').sort((a, b) => b[1] - a[1])
+        const refEntries = Object.entries(cats).filter(([c]) => catType(c) === 'refund').sort((a, b) => b[1] - a[1])
+
+        const totalExp = expEntries.reduce((s, [, v]) => s + v, 0)
+        const totalSav = [...savEntries, ...refEntries].reduce((s, [, v]) => s + v, 0)
+
+        // Single-point chart: 3 items so recharts positions the dot in the centre
+        const miniData = [
+          { label: '', expenses: null, savings: null },
+          { label: formatMonth(month), expenses: totalExp, savings: totalSav || null },
+          { label: '', expenses: null, savings: null },
+        ]
+
         return (
           <div key={month} className="summary-month">
-            <h2 className="summary-month-title">{formatMonth(month)}</h2>
+            <div className="archive-month-header">
+              <h2 className="summary-month-title">{formatMonth(month)}</h2>
+              <div className="archive-month-totals">
+                <span className="archive-total-item">
+                  <span className="archive-total-label">Spent</span>
+                  <span className="archive-total-value">${totalExp.toFixed(2)}</span>
+                </span>
+                {totalSav > 0 && <>
+                  <span className="archive-totals-sep">·</span>
+                  <span className="archive-total-item">
+                    <span className="archive-total-label">Saved</span>
+                    <span className="archive-total-value summary-remaining">${totalSav.toFixed(2)}</span>
+                  </span>
+                </>}
+              </div>
+            </div>
+
+            {/* Mini dot chart */}
+            <div className="archive-mini-chart">
+              <ResponsiveContainer width="100%" height={90}>
+                <LineChart data={miniData} margin={{ top: 16, right: 48, left: 48, bottom: 8 }}>
+                  <XAxis dataKey="label" hide />
+                  <YAxis hide domain={[0, dm => Math.max(dm, 10)]} />
+                  <Tooltip content={<ChartTooltip />} cursor={false} />
+                  <Line type="monotone" dataKey="expenses" stroke="#3b82f6" strokeWidth={0}
+                    connectNulls={false}
+                    dot={({ cx, cy, value }) => value == null || cx == null ? null
+                      : <circle cx={cx} cy={cy} r={8} fill="#3b82f6" />}
+                    activeDot={{ r: 10, fill: '#3b82f6' }}
+                  />
+                  <Line type="monotone" dataKey="savings" stroke="#10b981" strokeWidth={0}
+                    connectNulls={false}
+                    dot={({ cx, cy, value }) => value == null || cx == null ? null
+                      : <circle cx={cx} cy={cy} r={8} fill="#10b981" />}
+                    activeDot={{ r: 10, fill: '#10b981' }}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+              <div className="archive-chart-labels">
+                <span style={{ color: '#3b82f6' }}>● Expenses: ${totalExp.toFixed(2)}</span>
+                {totalSav > 0 && <span style={{ color: '#10b981' }}>● Saved: ${totalSav.toFixed(2)}</span>}
+              </div>
+            </div>
+
             <table className="summary-table">
               <thead>
                 <tr><th>Category</th><th>Total</th></tr>
               </thead>
               <tbody>
-                {sorted.map(([cat, amt]) => (
-                  <tr key={cat}>
-                    <td><span className="cat-emoji">{CATEGORY_EMOJI[cat] ?? '📦'}</span>{cat}</td>
-                    <td>${amt.toFixed(2)}</td>
+                {expEntries.length > 0 && <>
+                  <tr className="summary-section-header">
+                    <td colSpan={2}>Expenses</td>
                   </tr>
-                ))}
+                  {expEntries.map(([cat, amt]) => (
+                    <tr key={cat}>
+                      <td><span className="cat-emoji">{CATEGORY_EMOJI[cat] ?? '📦'}</span>{cat}</td>
+                      <td>${amt.toFixed(2)}</td>
+                    </tr>
+                  ))}
+                </>}
+                {savEntries.length > 0 && <>
+                  <tr className="summary-section-header summary-section-header--savings">
+                    <td colSpan={2}>Savings</td>
+                  </tr>
+                  {savEntries.map(([cat, amt]) => (
+                    <tr key={cat}>
+                      <td><span className="cat-emoji">{CATEGORY_EMOJI[cat] ?? '📦'}</span>{cat}</td>
+                      <td className="summary-savings-amount">${amt.toFixed(2)}</td>
+                    </tr>
+                  ))}
+                </>}
+                {refEntries.length > 0 && <>
+                  <tr className="summary-section-header summary-section-header--refund">
+                    <td colSpan={2}>Refunds</td>
+                  </tr>
+                  {refEntries.map(([cat, amt]) => (
+                    <tr key={cat}>
+                      <td><span className="cat-emoji">{CATEGORY_EMOJI[cat] ?? '📦'}</span>{cat}</td>
+                      <td className="summary-refund-amount">${amt.toFixed(2)}</td>
+                    </tr>
+                  ))}
+                </>}
               </tbody>
               <tfoot>
-                <tr><td>Total</td><td>${total.toFixed(2)}</td></tr>
+                <tr><td>Total Spent</td><td>${totalExp.toFixed(2)}</td></tr>
               </tfoot>
             </table>
           </div>
@@ -478,6 +698,7 @@ export default function App() {
   // pendingExpense holds the conversation thread when Claude asks a clarifying question
   // { thread: Array<{role, content}> } — appended each turn until ready: true
   const [pendingExpense, setPendingExpense] = useState(null)
+  const [lastExpense, setLastExpense] = useState(null) // { id, merchant, category, amount }
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const bottomRef = useRef(null)
@@ -545,11 +766,16 @@ export default function App() {
       const today = new Date().toISOString().split('T')[0]
 
       // ── Step 1: build message history ─────────────────────────────────────
-      // If we're in a clarification loop, prepend the existing thread so Claude
-      // has full context. apiMessages ends with the current user turn.
+      // In a clarification loop, prepend the existing thread. Otherwise, if
+      // there is a recently logged expense, prepend a context note so Claude
+      // can handle short follow-up corrections like "its toys" without asking
+      // for clarification about what expense the user means.
+      const contextNote = (!pendingExpense && lastExpense)
+        ? `[Context — last logged expense: "${lastExpense.merchant}", $${Number(lastExpense.amount).toFixed(2)}, ${lastExpense.category}]\n`
+        : ''
       const apiMessages = pendingExpense
         ? [...pendingExpense.thread, { role: 'user', content: text }]
-        : [{ role: 'user', content: text }]
+        : [{ role: 'user', content: contextNote + text }]
 
       // ── Step 2: call Claude ────────────────────────────────────────────────
       const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -616,6 +842,7 @@ export default function App() {
         if (updateError) throw new Error(updateError.message)
 
         await fetchExpenses()
+        setLastExpense(prev => prev ? { ...prev, ...parsed.fields } : prev)
 
         const changes = Object.entries(parsed.fields)
           .map(([k, v]) => `${k} → ${v}`)
@@ -656,7 +883,7 @@ export default function App() {
       }
 
       // ── Step 6: save to Supabase ───────────────────────────────────────────
-      const { error: dbError } = await supabase.from('expenses').insert({
+      const { data: insertedRows, error: dbError } = await supabase.from('expenses').insert({
         amount: finalAmount,
         merchant,
         category,
@@ -664,18 +891,19 @@ export default function App() {
         notes: notes ?? null,
         original_amount: needsConversion ? original_amount : null,
         original_currency: needsConversion ? original_currency : null,
-      })
+      }).select()
 
       if (dbError) throw new Error(dbError.message)
+      setLastExpense({ id: insertedRows?.[0]?.id ?? null, merchant, category, amount: finalAmount })
 
-      // ── Step 7: budget warning ─────────────────────────────────────────────
+      // ── Step 7: budget warning (expense categories only) ──────────────────
       const freshExpenses = await fetchExpenses()
       const currentMonth = new Date().toISOString().slice(0, 7)
       const monthTotal = freshExpenses
         .filter(e => e.category === category && e.date.slice(0, 7) === currentMonth)
         .reduce((sum, e) => sum + Number(e.amount), 0)
 
-      const budget = budgetMap[category]
+      const budget = catType(category) === 'expense' ? budgetMap[category] : null
       let warningText = null
       if (budget) {
         const pct = (monthTotal / budget.amount) * 100
