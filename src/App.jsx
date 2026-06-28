@@ -362,6 +362,7 @@ export default function App() {
 
       const data = await response.json()
       const rawText = data.content[0].text.trim()
+      console.log('RAW AI RESPONSE:', rawText)
 
       if (!rawText.startsWith('{')) {
         setMessages(prev => [...prev, {
