@@ -374,6 +374,119 @@
   color: #dc2626;
 }
 
+.edit-btn {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: none;
+  background: none;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s;
+}
+
+.edit-btn:hover {
+  background: var(--accent-bg);
+}
+
+/* Inline edit form */
+.log-row--editing {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 12px;
+  padding: 16px;
+}
+
+.edit-form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 10px;
+
+  @media (max-width: 600px) {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.edit-form-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.edit-form-field--wide {
+  grid-column: span 2;
+}
+
+.edit-input,
+.edit-select {
+  padding: 7px 10px;
+  border: 1.5px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--text-h);
+  font-size: 14px;
+  font-family: var(--sans);
+  outline: none;
+  transition: border-color 0.2s;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.edit-input:focus,
+.edit-select:focus {
+  border-color: var(--accent-border);
+}
+
+.edit-form-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.edit-save-btn {
+  padding: 7px 18px;
+  border-radius: 7px;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--sans);
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+.edit-save-btn:hover {
+  opacity: 0.85;
+}
+
+.edit-cancel-btn {
+  padding: 7px 18px;
+  border-radius: 7px;
+  border: 1.5px solid var(--border);
+  background: none;
+  color: var(--text-h);
+  font-size: 13px;
+  font-weight: 500;
+  font-family: var(--sans);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.edit-cancel-btn:hover {
+  background: var(--code-bg);
+}
+
 /* ── Summary view ───────────────────────────────────────────────────────────── */
 
 .summary-view {

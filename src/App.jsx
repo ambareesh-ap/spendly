@@ -37,13 +37,16 @@ const CATEGORY_EMOJI = Object.fromEntries(CATEGORIES.map(c => [c.name, c.emoji])
 const CATEGORY_NAMES = CATEGORIES.map(c => c.name).join(', ')
 
 function buildSystemPrompt(today) {
-  return `You are an expense parsing assistant for a Canadian user. Today's date is ${today}. You respond ONLY with one of two valid JSON shapes — nothing else.
+  return `You are an expense parsing assistant for a Canadian user. Today's date is ${today}. You respond ONLY with one of three valid JSON shapes — nothing else.
 
 SHAPE 1 — confident, log it:
 {"ready": true, "amount": <number>, "merchant": "<string>", "category": "<category>", "notes": <string|null>, "original_amount": <number|null>, "original_currency": "<ISO 4217 code|null>", "date": "<YYYY-MM-DD>"}
 
 SHAPE 2 — genuinely ambiguous, ask one clarifying question:
 {"ready": false, "question": "<one short question>", "partial": {"amount": <number|null>, "merchant": "<string|null>"}}
+
+SHAPE 3 — user is correcting a previous expense:
+{"action": "correct", "target": "<'last' or a merchant/description to match>", "fields": {<only the fields being changed, e.g. "amount": 18, "category": "Groceries">}}
 
 Allowed categories: ${CATEGORY_NAMES}
 
@@ -55,51 +58,59 @@ Shape 1 field rules:
 - original_currency: ISO 4217 code if the user mentions a non-CAD currency (e.g. "AED", "EUR", "INR", "USD"). null if CAD or unspecified
 - original_amount: same value as amount when original_currency is not null, otherwise null
 - date: the expense date in YYYY-MM-DD format. Infer from today (${today}) using these rules:
-  • Any explicit date or day name ("June 15", "on Tuesday", "the 3rd") → infer exactly, set ready: true
+  • Any explicit date or day name ("June 15", "on Tuesday", "the 3rd") → infer exactly, ready: true
   • "yesterday" → 1 day before today
-  • "last week" or "this past week" → 7 days before today (same weekday)
+  • "last week" / "this past week" → 7 days before today
   • "this week" → today
   • "last month" → first day of the previous calendar month
   • "this month" → today
   • "last year" → same month and day, one year ago
   • "a few days ago" → 3 days before today
   • "recently", "the other day", "a while ago", "earlier" → today
-  • ANY other relative time reference → make a reasonable inference and set ready: true
-  • If the user gives ZERO time context of any kind (no day, no week, no month, no relative phrase) AND amount is $50 or under → today, silently, ready: true
-  • If the user gives ZERO time context of any kind AND amount is over $50 → use Shape 2 to ask "Was this today, or a different date?" — but only after category is resolved; ask category first if that's also unclear
+  • ANY other relative time reference → make a reasonable inference, ready: true
+  • Zero time context AND amount ≤ $50 → today, silently, ready: true
+  • Zero time context AND amount > $50 → Shape 2: "Was this today, or a different date?" (only after category is resolved; ask category first if unclear)
+
+Shape 3 field rules:
+- Use when the user says "fix", "correct", "change", "update", "wrong", "actually it was", etc. about a past expense
+- target: use "last" if they say "my last expense" or don't specify which one; otherwise use the merchant name or a short description (e.g. "Walmart", "coffee", "rent")
+- fields: only include the keys the user wants to change (amount, merchant, category, notes, date)
 
 When to use Shape 2 (ask one question):
-- Category is genuinely ambiguous between two very different buckets (e.g. Electronics vs Entertainment for a gaming purchase) — ask category first
-- No date mentioned and amount > $50, and category is already resolved — ask date
-- The message is so vague you cannot extract a merchant or amount at all
+- Category genuinely ambiguous between very different buckets — ask category first
+- No date context and amount > $50, category already resolved — ask date
+- Message too vague to extract merchant or amount
 
-When NOT to use Shape 2 (just log it with Shape 1):
-- Obvious merchant → category pairs: Tim Hortons → Restaurants, Uber → Transportation, Netflix → Entertainment
-- Savings/investment contributions: TFSA, RRSP, FHSA, Money to India → use those category names directly
-- Any purchase $50 or under — pick the most likely category and default date to today
-- When the conversation history already resolved the ambiguity
+When NOT to use Shape 2:
+- Obvious merchant → category: Tim Hortons → Restaurants, Uber → Transportation, Netflix → Entertainment
+- Savings contributions: TFSA, RRSP, FHSA, Money to India → use those categories directly
+- Any purchase $50 or under — pick most likely category, default date to today
+- Conversation history already resolved the ambiguity
 
 STRICT OUTPUT FORMAT:
 - Start your response with { and end with }
 - Never include any explanation, apology, or text outside the JSON
 - Never start your response with the word I
-- If you cannot identify any expense at all, use Shape 2 with a question like "What did you spend money on?"`
+- If you cannot identify any expense at all, use Shape 2 with "What did you spend money on?"`
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 function formatDate(dateStr) {
-  const [y, m, d] = dateStr.split('-').map(Number)
-  return new Date(y, m - 1, d).toLocaleDateString('en-US', {
-    month: 'short', day: 'numeric', year: 'numeric',
-  })
+  if (!dateStr) return ''
+  // Slice to YYYY-MM-DD so both '2026-06-28' and '2026-06-28T00:00:00Z' work
+  const [y, m, d] = dateStr.slice(0, 10).split('-').map(Number)
+  const dt = new Date(y, m - 1, d)
+  if (isNaN(dt.getTime())) return dateStr
+  return dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
 }
 
 function formatMonth(yyyyMM) {
+  if (!yyyyMM) return ''
   const [y, m] = yyyyMM.split('-').map(Number)
-  return new Date(y, m - 1, 1).toLocaleDateString('en-US', {
-    month: 'long', year: 'numeric',
-  })
+  const dt = new Date(y, m - 1, 1)
+  if (isNaN(dt.getTime())) return yyyyMM
+  return dt.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
 }
 
 // ── Chat sub-components ────────────────────────────────────────────────────────
@@ -151,28 +162,98 @@ function TypingIndicator() {
 
 // ── Log view ───────────────────────────────────────────────────────────────────
 
-function LogView({ expenses, loading, onDelete }) {
+function LogView({ expenses, loading, onDelete, onUpdate }) {
+  const [editingId, setEditingId] = useState(null)
+  const [editValues, setEditValues] = useState({})
+
+  const startEdit = (exp) => {
+    setEditingId(exp.id)
+    setEditValues({
+      date: exp.date,
+      merchant: exp.merchant,
+      amount: String(exp.amount),
+      category: exp.category,
+      notes: exp.notes ?? '',
+    })
+  }
+
+  const cancelEdit = () => setEditingId(null)
+
+  const saveEdit = async () => {
+    await onUpdate(editingId, {
+      date: editValues.date,
+      merchant: editValues.merchant,
+      amount: parseFloat(editValues.amount),
+      category: editValues.category,
+      notes: editValues.notes || null,
+    })
+    setEditingId(null)
+  }
+
+  const set = (key) => (e) => setEditValues(v => ({ ...v, [key]: e.target.value }))
+
   if (loading) return <div className="empty-state">Loading…</div>
   if (!expenses.length) {
     return <div className="empty-state">No expenses yet. Head to Chat to log one.</div>
   }
+
   return (
     <div className="log-view">
-      {expenses.map(exp => (
-        <div key={exp.id} className="log-row">
-          <div className="log-row-icon">{CATEGORY_EMOJI[exp.category] ?? '📦'}</div>
-          <div className="log-row-info">
-            <div className="log-row-merchant">{exp.merchant}</div>
-            {exp.notes && <div className="log-row-notes">{exp.notes}</div>}
-            <span className="category-pill">{exp.category}</span>
+      {expenses.map(exp => {
+        if (exp.id === editingId) {
+          return (
+            <div key={exp.id} className="log-row log-row--editing">
+              <div className="edit-form-grid">
+                <label className="edit-form-field">
+                  <span>Date</span>
+                  <input className="edit-input" type="date" value={editValues.date} onChange={set('date')} />
+                </label>
+                <label className="edit-form-field">
+                  <span>Merchant</span>
+                  <input className="edit-input" type="text" value={editValues.merchant} onChange={set('merchant')} />
+                </label>
+                <label className="edit-form-field">
+                  <span>Amount ($)</span>
+                  <input className="edit-input" type="number" min="0" step="0.01" value={editValues.amount} onChange={set('amount')} />
+                </label>
+                <label className="edit-form-field">
+                  <span>Category</span>
+                  <select className="edit-select" value={editValues.category} onChange={set('category')}>
+                    {CATEGORIES.map(c => (
+                      <option key={c.name} value={c.name}>{c.emoji} {c.name}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="edit-form-field edit-form-field--wide">
+                  <span>Notes</span>
+                  <input className="edit-input" type="text" value={editValues.notes} placeholder="optional" onChange={set('notes')} />
+                </label>
+              </div>
+              <div className="edit-form-actions">
+                <button className="edit-save-btn" onClick={saveEdit}>Save</button>
+                <button className="edit-cancel-btn" onClick={cancelEdit}>Cancel</button>
+              </div>
+            </div>
+          )
+        }
+
+        return (
+          <div key={exp.id} className="log-row">
+            <div className="log-row-icon">{CATEGORY_EMOJI[exp.category] ?? '📦'}</div>
+            <div className="log-row-info">
+              <div className="log-row-merchant">{exp.merchant}</div>
+              {exp.notes && <div className="log-row-notes">{exp.notes}</div>}
+              <span className="category-pill">{exp.category}</span>
+            </div>
+            <div className="log-row-meta">
+              <div className="log-row-amount">${Number(exp.amount).toFixed(2)}</div>
+              <div className="log-row-date">{formatDate(exp.date)}</div>
+            </div>
+            <button className="edit-btn" onClick={() => startEdit(exp)} title="Edit">✏️</button>
+            <button className="delete-btn" onClick={() => onDelete(exp.id)} title="Delete">×</button>
           </div>
-          <div className="log-row-meta">
-            <div className="log-row-amount">${Number(exp.amount).toFixed(2)}</div>
-            <div className="log-row-date">{formatDate(exp.date)}</div>
-          </div>
-          <button className="delete-btn" onClick={() => onDelete(exp.id)} title="Delete">×</button>
-        </div>
-      ))}
+        )
+      })}
     </div>
   )
 }
@@ -437,6 +518,11 @@ export default function App() {
     fetchExpenses()
   }
 
+  const handleUpdate = async (id, fields) => {
+    await supabase.from('expenses').update(fields).eq('id', id)
+    await fetchExpenses()
+  }
+
   const saveBudget = async (category, amount) => {
     const existing = budgetMap[category]
     if (existing?.id) {
@@ -509,7 +595,39 @@ export default function App() {
         return
       }
 
-      // ── Step 3: clarification needed — ask and wait ────────────────────────
+      // ── Step 3: correction request ────────────────────────────────────────
+      if (parsed.action === 'correct') {
+        setPendingExpense(null)
+        const keyword = (parsed.target ?? '').toLowerCase()
+        const target = keyword === 'last'
+          ? expenses[0]
+          : expenses.find(e => e.merchant.toLowerCase().includes(keyword))
+
+        if (!target) {
+          setMessages(prev => [...prev, {
+            id: Date.now(), role: 'assistant',
+            text: "I couldn't find that expense — try editing it directly in the Log tab.",
+          }])
+          return
+        }
+
+        const { error: updateError } = await supabase
+          .from('expenses').update(parsed.fields).eq('id', target.id)
+        if (updateError) throw new Error(updateError.message)
+
+        await fetchExpenses()
+
+        const changes = Object.entries(parsed.fields)
+          .map(([k, v]) => `${k} → ${v}`)
+          .join(', ')
+        setMessages(prev => [...prev, {
+          id: Date.now(), role: 'assistant',
+          text: `Updated! ${target.merchant}: ${changes}`,
+        }])
+        return
+      }
+
+      // ── Step 4: clarification needed — ask and wait ────────────────────────
       if (!parsed.ready) {
         setMessages(prev => [...prev, {
           id: Date.now(), role: 'assistant', text: parsed.question,
@@ -654,7 +772,7 @@ export default function App() {
         </div>
       </div>
 
-      {tab === 'log'     && <LogView expenses={expenses} loading={expensesLoading} onDelete={handleDelete} />}
+      {tab === 'log'     && <LogView expenses={expenses} loading={expensesLoading} onDelete={handleDelete} onUpdate={handleUpdate} />}
       {tab === 'summary' && <SummaryView expenses={expenses} budgetMap={budgetMap} />}
       {tab === 'archive' && <ArchiveView expenses={expenses} />}
       {tab === 'budgets' && <BudgetView budgetMap={budgetMap} onSave={saveBudget} />}
